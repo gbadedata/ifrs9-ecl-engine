@@ -138,6 +138,7 @@ python analysis.py        # reproduces all figures and results.json
 ```
 .
 ├── analysis.py                 # full PD / LGD / EAD / staging / ECL / scenario pipeline
+├── ifrs9_ecl_engine.ipynb      # the same pipeline as an executed notebook
 ├── results.json                # all computed figures
 ├── figures/                    # seven generated charts
 ├── data/
@@ -150,3 +151,7 @@ python analysis.py        # reproduces all figures and results.json
 ## Data licence
 
 The **code** is released under the MIT License (see `LICENSE`). The underlying **Lending Club** loan data is publicly available and used here for a non-commercial portfolio project; it remains subject to its own terms.
+
+---
+
+*Built as a portfolio project demonstrating IFRS 9 expected-credit-loss methodology on real loan data.*
