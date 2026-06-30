@@ -1,0 +1,53 @@
+{
+  "n_total": 2260701,
+  "n_completed": 1348099,
+  "n_active": 907864,
+  "pd_auc": 0.692,
+  "pd_gini": 0.384,
+  "pd_ks": 0.277,
+  "portfolio_dr": 0.1998,
+  "lgd_mean": 0.909,
+  "recovery_rate": 0.091,
+  "n_lgd": 269338,
+  "sicr_threshold_pd": 0.324,
+  "total_ead": 9510001923.0,
+  "total_ecl": 1245504798.0,
+  "coverage": 0.131,
+  "stage": {
+    "1": {
+      "n": 746242,
+      "ead": 7441255642.0,
+      "ecl": 489938948.0,
+      "coverage": 0.0658
+    },
+    "2": {
+      "n": 140181,
+      "ead": 1824499915.0,
+      "ecl": 567301071.0,
+      "coverage": 0.3109
+    },
+    "3": {
+      "n": 21441,
+      "ead": 244246366.0,
+      "ecl": 188264778.0,
+      "coverage": 0.7708
+    }
+  },
+  "scenarios": {
+    "Upside": 1086918795.0,
+    "Base": 1245504798.0,
+    "Downside": 1660477031.0
+  },
+  "weights": {
+    "Upside": 0.25,
+    "Base": 0.45,
+    "Downside": 0.3
+  },
+  "pd_mult": {
+    "up": 0.85,
+    "down": 1.4
+  },
+  "weighted_ecl": 1330349967.0,
+  "crisis_dr": 0.2021,
+  "benign_dr": 0.2064
+}
