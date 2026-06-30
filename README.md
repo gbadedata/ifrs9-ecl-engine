@@ -150,7 +150,3 @@ python analysis.py        # reproduces all figures and results.json
 ## Data licence
 
 The **code** is released under the MIT License (see `LICENSE`). The underlying **Lending Club** loan data is publicly available and used here for a non-commercial portfolio project; it remains subject to its own terms.
-
----
-
-*Built as a portfolio project demonstrating IFRS 9 expected-credit-loss methodology on real loan data.*
