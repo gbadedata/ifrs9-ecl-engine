@@ -2,3 +2,7 @@ __pycache__/
 .ipynb_checkpoints/
 *.pyc
 .DS_Store
+
+# Data is not redistributed: download the Kaggle file locally
+data/raw/
+data/*.parquet

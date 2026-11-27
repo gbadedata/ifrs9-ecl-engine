@@ -1,53 +1,94 @@
 {
-  "n_total": 2260701,
-  "n_completed": 1348099,
-  "n_active": 907864,
-  "pd_auc": 0.692,
-  "pd_gini": 0.384,
-  "pd_ks": 0.277,
-  "portfolio_dr": 0.1998,
-  "lgd_mean": 0.909,
-  "recovery_rate": 0.091,
-  "n_lgd": 269338,
-  "sicr_threshold_pd": 0.324,
-  "total_ead": 9510001923.0,
-  "total_ecl": 1245504798.0,
-  "coverage": 0.131,
+  "snapshot": "Mar 2019",
+  "currency": "USD",
+  "n_total": 2260668,
+  "n_active": 907904,
+  "active_definition": "Current, In Grace Period, Late (16-30), Late (31-120) or Default with principal outstanding",
+  "pd_model": {
+    "outcome": "default within 12 months of issue",
+    "train": "<=2015 (n=887,440)",
+    "out_of_time": "2016-2017 (n=759,338)",
+    "auc": 0.685,
+    "gini": 0.37,
+    "ks": 0.266,
+    "predicted_over_observed": 0.827
+  },
+  "lgd": {
+    "mean_matured": 0.899,
+    "n_matured": 114333,
+    "mean_all_chargeoffs": 0.909,
+    "workout_months": 24
+  },
+  "staging": {
+    "rule": "Stage 3: Default status, or Late (31-120) with 3+ months since last payment; Stage 2: 31+ dpd, or 12m PD >= 2.0x the origination expectation and +1%",
+    "latest_fico_available": 0.999,
+    "sicr_only": 17737
+  },
+  "total_ead": 9510384856.0,
+  "total_ecl": 700141178.0,
+  "coverage": 0.0736,
   "stage": {
     "1": {
-      "n": 746242,
-      "ead": 7441255642.0,
-      "ecl": 489938948.0,
-      "coverage": 0.0658
+      "n": 868686,
+      "ead": 9142982654.0,
+      "ecl": 556132345.0,
+      "coverage": 0.0608
     },
     "2": {
-      "n": 140181,
-      "ead": 1824499915.0,
-      "ecl": 567301071.0,
-      "coverage": 0.3109
+      "n": 29999,
+      "ead": 260814960.0,
+      "ecl": 48167037.0,
+      "coverage": 0.1847
     },
     "3": {
-      "n": 21441,
-      "ead": 244246366.0,
-      "ecl": 188264778.0,
-      "coverage": 0.7708
+      "n": 9219,
+      "ead": 106587242.0,
+      "ecl": 95841795.0,
+      "coverage": 0.8992
     }
   },
   "scenarios": {
-    "Upside": 1086918795.0,
-    "Base": 1245504798.0,
-    "Downside": 1660477031.0
+    "Upside": 617822194.0,
+    "Base": 700141178.0,
+    "Downside": 908899844.0
+  },
+  "overlays": {
+    "Upside": 0.85,
+    "Base": 1.0,
+    "Downside": 1.4
   },
   "weights": {
     "Upside": 0.25,
     "Base": 0.45,
     "Downside": 0.3
   },
-  "pd_mult": {
-    "up": 0.85,
-    "down": 1.4
+  "scenario_note": "illustrative judgemental PD overlays, not a macroeconomic model",
+  "weighted_ecl": 742189032.0,
+  "sensitivity_31_120_bucket": {
+    "all 31-120 dpd in Stage 3": 797375076.0,
+    "base (3+ months unpaid in Stage 3)": 700141178.0,
+    "all 31-120 dpd in Stage 2": 629743578.0
   },
-  "weighted_ecl": 1330349967.0,
-  "crisis_dr": 0.2021,
-  "benign_dr": 0.2064
+  "sensitivity_sicr": {
+    "x1.5": {
+      "stage2_ead_pct": 6.83,
+      "ecl": 718780793.0
+    },
+    "x2": {
+      "stage2_ead_pct": 2.74,
+      "ecl": 700141178.0
+    },
+    "x2.5": {
+      "stage2_ead_pct": 1.78,
+      "ecl": 695671521.0
+    },
+    "x3": {
+      "stage2_ead_pct": 1.54,
+      "ecl": 694519012.0
+    },
+    "x4": {
+      "stage2_ead_pct": 1.46,
+      "ecl": 694115639.0
+    }
+  }
 }

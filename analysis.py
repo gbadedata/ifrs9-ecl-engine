@@ -1,263 +1,417 @@
-"""
-IFRS 9 Expected Credit Loss (ECL) engine on real Lending Club loans.
-Builds PD (12-month and lifetime), empirical LGD, EAD, three-stage IFRS 9 staging,
-and probability-weighted macroeconomic scenarios. All figures from real data.
-"""
+# %% [markdown]
+# # IFRS 9 expected credit loss (ECL) engine
+#
+# An end-to-end IFRS 9 impairment calculation on the live Lending Club book at the data snapshot
+# (March 2019, the latest payment date in the file). Amounts are US dollars.
+#
+# | Component | Approach |
+# |---|---|
+# | PD | A 12-month PD model (logistic, application data) ranks borrowers; an empirical default term structure by months on book, per grade, sets the level and shape. 12-month and lifetime PD are conditional on how long each loan has already survived. |
+# | Staging | Stage 3: Lending Club "Default" status, or 31-120 days late with 3+ months since the last payment. Stage 2: 31+ days past due, or a significant increase in credit risk (SICR): the 12-month PD at the reporting date (re-scored with the latest FICO) is at least double, and at least 1 point above, the 12-month PD expected at origination for the same months on book. |
+# | LGD | Empirical, from charge-offs whose recoveries have had at least 24 months to come in. |
+# | EAD | Scheduled amortising balance, month by month over the remaining term. |
+# | ECL | Sum over future months of survival x marginal PD x LGD x EAD, discounted at the loan's interest rate: 12 months for Stage 1, lifetime for Stage 2, balance x LGD for Stage 3. |
+# | Scenarios | Illustrative judgemental PD overlays (not a macroeconomic model), probability-weighted. |
+#
+# Default is dated at last payment plus four months (about 90 days past due), because the file has no
+# delinquency history. Data: Lending Club accepted loans 2007-2018Q4 (Kaggle `wordsforthewise/lending-club`);
+# set `LENDING_CLUB_CSV` to the file.
+
+# %%
 import warnings; warnings.filterwarnings("ignore")
-import numpy as np, pandas as pd, json, os
+import json, os
+import numpy as np, pandas as pd
 import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
 from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder
 from sklearn.metrics import roc_auc_score, roc_curve
 from sklearn.calibration import calibration_curve
 
-RAW = "/mnt/user-data/uploads/accepted_2007_to_2018Q4_csv.gz"
-OUT = "/home/claude/ifrs9"; FIG = f"{OUT}/figures"; DAT = f"{OUT}/data"
-os.makedirs(FIG, exist_ok=True); os.makedirs(DAT, exist_ok=True)
+import lending_club as lc
 
-NAVY="#16314E"; TEAL="#1C8C7D"; AMBER="#C8862B"; RED="#B23A48"; SLATE="#5B6B7B"; ICE="#EAF0F6"; GREEN="#2E7D5B"
+OUT = "."; FIG = f"{OUT}/figures"; DAT = f"{OUT}/data"
+os.makedirs(FIG, exist_ok=True); os.makedirs(DAT, exist_ok=True)
+NAVY="#16314E"; TEAL="#1C8C7D"; AMBER="#C8862B"; RED="#B23A48"; SLATE="#5B6B7B"; GREEN="#2E7D5B"
 plt.rcParams.update({"font.family":"DejaVu Sans","axes.edgecolor":"#9AA7B5","axes.linewidth":0.8,
     "axes.grid":True,"grid.color":"#E2E8EF","grid.linewidth":0.7,"axes.axisbelow":True,"figure.dpi":120})
-gbp = lambda x,_=None: f"${x/1e6:,.0f}m" if abs(x)>=1e6 else f"${x/1e3:,.0f}k"
+usd = lambda x,_=None: f"${x/1e9:,.2f}bn" if abs(x)>=1e9 else (f"${x/1e6:,.0f}m" if abs(x)>=1e6 else f"${x/1e3:,.0f}k")
 
-USE = ['loan_amnt','funded_amnt','term','int_rate','installment','issue_d','loan_status','out_prncp',
-       'total_rec_prncp','recoveries','collection_recovery_fee','grade','sub_grade','fico_range_low',
-       'fico_range_high','annual_inc','dti','emp_length','home_ownership','purpose','verification_status',
+SICR_RATIO = 2.0         # reporting 12m PD must be at least this multiple of the origination expectation
+SICR_ABS = 0.01          # ... and at least this many PD points above it
+STAGE3_MONTHS = 3        # months since last payment treated as 90+ days past due
+LGD_WORKOUT = 24         # months of recovery history required for a charge-off to enter the LGD estimate
+OVERLAY = {"Upside": 0.85, "Base": 1.00, "Downside": 1.40}   # judgemental PD multipliers
+WEIGHT = {"Upside": 0.25, "Base": 0.45, "Downside": 0.30}
+MAXT = 60
+
+USE = ['loan_amnt','funded_amnt','int_rate','installment','out_prncp','total_rec_prncp','recoveries',
+       'collection_recovery_fee','grade','fico_range_low','fico_range_high','last_fico_range_low',
+       'last_fico_range_high','annual_inc','dti','emp_length','home_ownership','purpose','verification_status',
        'revol_util','delinq_2yrs','inq_last_6mths','open_acc','pub_rec','total_acc','earliest_cr_line']
-
-def yr(s):
-    try: return int(str(s).split("-")[-1])
-    except: return np.nan
 EMP = {'< 1 year':0,'1 year':1,'2 years':2,'3 years':3,'4 years':4,'5 years':5,'6 years':6,
        '7 years':7,'8 years':8,'9 years':9,'10+ years':10}
 
-print("Reading raw loan tape in chunks ...")
-chunks=[]
-for ch in pd.read_csv(RAW, usecols=USE, chunksize=300000, low_memory=False):
-    ch['term_months']=ch['term'].astype(str).str.extract(r'(\d+)').astype(float)
-    ch['int_rate']=pd.to_numeric(ch['int_rate'].astype(str).str.replace('%',''),errors='coerce')
-    ch['issue_year']=ch['issue_d'].map(yr)
-    ch['fico']=(ch['fico_range_low']+ch['fico_range_high'])/2
-    ch['emp_length_num']=ch['emp_length'].map(EMP)
-    ch['credit_history_yrs']=ch['issue_year']-ch['earliest_cr_line'].map(yr)
-    ch['annual_inc']=pd.to_numeric(ch['annual_inc'],errors='coerce')
-    ch['payment_to_income']=(ch['installment']*12)/ch['annual_inc'].replace(0,np.nan)
-    ch['loan_to_income']=ch['loan_amnt']/ch['annual_inc'].replace(0,np.nan)
-    keep=['loan_amnt','funded_amnt','term_months','int_rate','installment','issue_year','loan_status',
-          'out_prncp','total_rec_prncp','recoveries','collection_recovery_fee','grade','sub_grade','fico',
-          'annual_inc','dti','emp_length_num','home_ownership','purpose','verification_status','revol_util',
-          'delinq_2yrs','inq_last_6mths','open_acc','pub_rec','total_acc','credit_history_yrs',
-          'payment_to_income','loan_to_income']
-    chunks.append(ch[keep])
-df=pd.concat(chunks,ignore_index=True); del chunks
-print(f"  total rows: {len(df):,}")
+print("Reading loan tape ...")
+df = lc.load(usecols=USE)
+SNAP = df.attrs["snapshot_m"]
+print(" ", lc.describe(df))
+num = lambda c: pd.to_numeric(df[c], errors="coerce")
+df['int_rate'] = pd.to_numeric(df['int_rate'].astype(str).str.replace('%',''), errors='coerce')
+df['fico'] = (num('fico_range_low') + num('fico_range_high')) / 2
+lf = (num('last_fico_range_low') + num('last_fico_range_high')) / 2
+df['last_fico'] = lf.where(lf >= 300)                       # 0 means no later pull
+df['annual_inc'] = num('annual_inc')
+df['payment_to_income'] = (num('installment')*12 / df['annual_inc'].replace(0, np.nan)).clip(0, 2)
+df['loan_to_income'] = (num('loan_amnt') / df['annual_inc'].replace(0, np.nan)).clip(0, 10)
+df['log_income'] = np.log1p(df['annual_inc'].clip(0, 1e6))
+df['dti'] = num('dti').clip(-1, 100)
+df['revol_util'] = pd.to_numeric(df['revol_util'].astype(str).str.replace('%',''), errors='coerce').clip(0, 200)
+df['emp_length_num'] = df['emp_length'].map(EMP)
+df['credit_history_yrs'] = (df['issue_m'] - lc.month_index(df['earliest_cr_line'])) / 12
 
-# ---- clip / clean numerics
-df['payment_to_income']=df['payment_to_income'].clip(0,2)
-df['loan_to_income']=df['loan_to_income'].clip(0,10)
-df['revol_util']=pd.to_numeric(df['revol_util'].astype(str).str.replace('%',''),errors='coerce').clip(0,200)
-df['dti']=pd.to_numeric(df['dti'],errors='coerce').clip(-1,100)
+NUM = ['fico','dti','log_income','payment_to_income','loan_to_income','term_months','emp_length_num',
+       'revol_util','delinq_2yrs','inq_last_6mths','open_acc','pub_rec','total_acc','credit_history_yrs']
+CAT = ['home_ownership','purpose','verification_status']
+for c in NUM: df[c] = pd.to_numeric(df[c], errors='coerce')
+for c in CAT: df[c] = df[c].fillna('missing').astype(str)
 
-CHARGED={'Charged Off','Default','Does not meet the credit policy. Status:Charged Off'}
-PAID={'Fully Paid','Does not meet the credit policy. Status:Fully Paid'}
-ACTIVE_ST={'Current','In Grace Period','Late (16-30 days)','Late (31-120 days)'}
+# %% [markdown]
+# ## 1. 12-month PD model
+# A logistic regression on application data predicts default within 12 months of issue. It is trained on loans
+# issued up to 2015 and tested on 2016-2017 issues, using only loans whose 12-month window had passed by the
+# snapshot. Lending Club's own grade and interest rate are left out of the features. The model's job here is
+# to rank borrowers within a grade; the PD level comes from the observed term structure in section 2.
 
-df['completed']=df['loan_status'].isin(CHARGED|PAID)
-df['default']=df['loan_status'].isin(CHARGED).astype(int)
-df['active']=df['loan_status'].isin(ACTIVE_ST) & (df['out_prncp']>0)
-
-NUM=['fico','dti','annual_inc','payment_to_income','loan_to_income','term_months','emp_length_num',
-     'revol_util','delinq_2yrs','inq_last_6mths','open_acc','pub_rec','total_acc','credit_history_yrs']
-CAT=['home_ownership','purpose','verification_status']
-df['annual_inc']=np.log1p(df['annual_inc'].clip(0,1e6))   # log income for the model
-for c in NUM: df[c]=pd.to_numeric(df[c],errors='coerce')
-
+# %%
 # =====================================================================
-# 1) PD MODEL  (logistic, time-based validation, calibrated)
+# 1) 12-MONTH PD MODEL  (fixed window, out-of-time validation)
 # =====================================================================
-comp=df[df['completed']].copy()
-comp[NUM]=comp[NUM].fillna(comp[NUM].median())
-for c in CAT: comp[c]=comp[c].fillna('missing').astype(str)
-tr=comp[comp['issue_year']<=2015]; te=comp[comp['issue_year']>=2016]
-print(f"PD train {len(tr):,} (<=2015)  test {len(te):,} (>=2016)  | default rate {comp['default'].mean():.3f}")
+obs12, bad12 = lc.window_outcome(df, 12)
+df['obs_12'] = obs12; df['bad_12'] = bad12
+pop = df[df['obs_12']].copy()
+med = pop[NUM].median()
+tr = pop[pop['issue_year'] <= 2015]; te = pop[pop['issue_year'] >= 2016]
+print(f"12m PD: train {len(tr):,} loans issued <=2015 ({tr['bad_12'].mean():.2%} default) | "
+      f"out-of-time {len(te):,} issued 2016-{int(te['issue_year'].max())} ({te['bad_12'].mean():.2%})")
+pre = ColumnTransformer([("n", StandardScaler(), NUM), ("c", OneHotEncoder(handle_unknown='ignore', min_frequency=0.01), CAT)])
+pd_model = Pipeline([("p", pre), ("lr", LogisticRegression(max_iter=2000, C=1.0))])
+pd_model.fit(tr[NUM+CAT].fillna(med), tr['bad_12'])
+te_p = pd_model.predict_proba(te[NUM+CAT].fillna(med))[:, 1]
+auc = roc_auc_score(te['bad_12'], te_p); gini = 2*auc - 1
+fpr, tpr, _ = roc_curve(te['bad_12'], te_p); ks = float(np.max(tpr - fpr))
+po_ratio = float(te_p.mean() / te['bad_12'].mean())
+print(f"  out-of-time AUC {auc:.3f}  Gini {gini:.3f}  KS {ks:.3f}  predicted/observed {po_ratio:.2f}")
 
-pre=ColumnTransformer([("n",StandardScaler(),NUM),
-                       ("c",OneHotEncoder(handle_unknown='ignore',min_frequency=0.01),CAT)])
-pd_model=Pipeline([("p",pre),("lr",LogisticRegression(max_iter=2000,C=1.0))])
-pd_model.fit(tr[NUM+CAT],tr['default'])
-te_p=pd_model.predict_proba(te[NUM+CAT])[:,1]
-auc=roc_auc_score(te['default'],te_p)
-fpr,tpr,_=roc_curve(te['default'],te_p); ks=float(np.max(tpr-fpr))
-gini=2*auc-1
-print(f"  PD lifetime model: AUC {auc:.3f}  Gini {gini:.3f}  KS {ks:.3f}")
+# %% [markdown]
+# ## 2. Default term structure
+# For each grade, the monthly default rate by months on book: defaults in that month divided by loans still on
+# book at its start. Loans leave the risk set when they default, repay in full, or reach the last month that is
+# observable at the snapshot. Months with fewer than 200 loans at risk borrow the pooled shape, scaled to the grade.
 
+# %%
 # =====================================================================
-# 2) LGD  (empirical, from charged-off loans)
+# 2) DEFAULT TERM STRUCTURE  (marginal default rate by months on book, per grade)
 # =====================================================================
-co=df[df['loan_status'].isin(CHARGED)].copy()
-co['ead_at_default']=(co['funded_amnt']-co['total_rec_prncp']).clip(lower=0)
-co=co[co['ead_at_default']>0]
-co['net_recovery']=(co['recoveries'].fillna(0)-co['collection_recovery_fee'].fillna(0)).clip(lower=0)
-co['lgd']=(1-co['net_recovery']/co['ead_at_default']).clip(0,1)
-lgd_mean=float(co['lgd'].mean())
-lgd_by_term=co.groupby('term_months')['lgd'].mean().to_dict()
-rec_rate=float((co['net_recovery']/co['ead_at_default']).clip(0,1).mean())
-print(f"  LGD: portfolio mean {lgd_mean:.3f}  (recovery rate {rec_rate:.3f}, n={len(co):,})")
+# Each loan is followed until it defaults, repays in full, or reaches the last month whose
+# outcome is observable (snapshot minus the charge-off lag); hazard = defaults / loans at risk.
+horizon = (SNAP - lc.SETTLE_MONTHS - df['issue_m']).clip(lower=0)
+paid = df['loan_status'].str.contains('Fully Paid', na=False)
+exit_mob = np.where(df['charged_off'], df['mob_default'],
+           np.where(paid, df['last_pymnt_m'] - df['issue_m'], horizon))
+exit_mob = np.minimum(np.nan_to_num(exit_mob, nan=0), np.minimum(horizon, df['term_months'])).astype(int)
+is_def = (df['charged_off'] & (df['mob_default'] <= horizon) & (df['mob_default'] <= df['term_months'])).values
+grades = sorted(g for g in df['grade'].dropna().unique())
+def hazard_curve(mask):
+    em = exit_mob[mask]; dm = exit_mob[mask & is_def]
+    exits = np.bincount(np.clip(em, 0, MAXT), minlength=MAXT+1)
+    at_risk = exits[::-1].cumsum()[::-1]             # loans still on book at the start of each month
+    defs = np.bincount(np.clip(dm, 0, MAXT), minlength=MAXT+1)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        h = np.where(at_risk >= 200, defs / at_risk, np.nan)
+    h[0] = 0.0
+    return h, at_risk
+H_pool, _ = hazard_curve(np.ones(len(df), bool))
+H_pool = pd.Series(H_pool).ffill().fillna(0).values
+H = {}
+for g in grades:
+    h, _ = hazard_curve((df['grade'] == g).values)
+    h = pd.Series(h)
+    scale = np.nanmedian((h / pd.Series(H_pool)).replace([np.inf, -np.inf], np.nan).iloc[1:25]) if h.notna().sum() > 3 else 1.0
+    H[g] = h.fillna(pd.Series(H_pool) * scale).values      # thin late months: pooled shape at the grade's level
 
+# %% [markdown]
+# ## 3. PD for the live book
+# Each live loan's relative risk is its model PD divided by its grade's average. That multiplies the grade's
+# term structure from the loan's current age onwards, giving a 12-month and a lifetime PD conditional on
+# survival so far. The same is done with the origination data, to get the 12-month PD that was expected at
+# origination for a loan of this age; the reporting-date version uses the borrower's latest FICO.
+
+# %%
 # =====================================================================
-# 3) ACTIVE PORTFOLIO  ->  EAD, PD horizons, STAGING, ECL
+# 3) ACTIVE BOOK: PD at origination and at the reporting date
 # =====================================================================
-act=df[df['active']].copy()
-act[NUM]=act[NUM].fillna(comp[NUM].median())
-for c in CAT: act[c]=act[c].fillna('missing').astype(str)
-act['pd_life']=pd_model.predict_proba(act[NUM+CAT])[:,1]
-# remaining life (yrs) from outstanding principal and installment (amortisation proxy)
-act['rem_months']=(act['out_prncp']/act['installment'].replace(0,np.nan)).clip(1,act['term_months'])
-act['rem_yrs']=(act['rem_months']/12).clip(0.1,5)
-# 12-month PD from lifetime PD via constant-hazard over remaining life
-act['pd_12m']=(1-(1-act['pd_life']).clip(1e-6,1)**(np.minimum(12,act['rem_months'])/act['rem_months'])).clip(0,1)
-act['EAD']=act['out_prncp']
-act['lgd']=act['term_months'].map(lgd_by_term).fillna(lgd_mean)
-eir=(act['int_rate']/100).clip(0.03,0.35)
+act = df[df['active']].copy()
+n_act = len(act)
+act['age'] = (SNAP - act['issue_m']).clip(lower=0).astype(int)
+act['rem'] = (act['term_months'] - act['age']).clip(lower=1, upper=MAXT).astype(int)
+X_orig = act[NUM+CAT].copy(); X_orig[NUM] = X_orig[NUM].fillna(med)
+X_rep = X_orig.copy(); X_rep['fico'] = act['last_fico'].fillna(act['fico']).fillna(med['fico'])
+p_orig = pd_model.predict_proba(X_orig)[:, 1]
+p_rep = pd_model.predict_proba(X_rep)[:, 1]
+# relative risk vs the grade's average 12m PD in the training population
+grade_mean = tr.assign(p=pd_model.predict_proba(tr[NUM+CAT].fillna(med))[:, 1]).groupby('grade')['p'].mean()
+gm = act['grade'].map(grade_mean).fillna(float(tr['bad_12'].mean())).values
+k_orig = p_orig / gm; k_rep = p_rep / gm
+HTAB = np.vstack([H[g] for g in grades] + [H_pool])                               # grades x (MAXT+1)
+gcode = act['grade'].map({g: i for i, g in enumerate(grades)}).fillna(len(grades)).astype(int).values
+age = act['age'].values; rem = act['rem'].values
+def pd_over(k, months, mult=1.0):
+    """PD over the next `months` from the reporting date, conditional on survival to `age`."""
+    s = np.ones(n_act)
+    for t in range(1, MAXT+1):
+        m = np.minimum(age + t, MAXT)
+        h = np.clip(HTAB[gcode, m] * k * mult, 0, 0.99)
+        live = t <= months
+        s = np.where(live, s * (1 - h), s)
+    return 1 - s
+act['pd12_expected'] = pd_over(k_orig, np.minimum(12, rem))
+act['pd12'] = pd_over(k_rep, np.minimum(12, rem))
+act['pd_life'] = pd_over(k_rep, rem)
 
-# ---- IFRS 9 staging
-SICR=act['pd_life'].quantile(0.85)   # SICR threshold for performing loans (simplified)
-stage=np.where(act['loan_status'].isin({'Late (31-120 days)','Default'}),3,
-        np.where(act['loan_status'].isin({'In Grace Period','Late (16-30 days)'}) | (act['pd_life']>SICR),2,1))
-act['stage']=stage
+# %% [markdown]
+# ## 4. Staging
+# Lending Club's "Late (31-120 days)" status covers loans one to four months behind. Those with three or more
+# months since their last payment are treated as 90+ days past due and go to Stage 3 with the "Default" status
+# (121+ days); the rest go to Stage 2 under the 30-days-past-due backstop. Stage 2 also takes performing loans
+# that meet the SICR test. Everything else is Stage 1.
 
-# ---- ECL = EAD * PD * LGD, discounted at EIR
-disc1=1/(1+eir)                                   # 12m discount
-discL=1/(1+eir)**(act['rem_yrs']/2)               # lifetime mid-point discount
-ecl=np.where(act['stage']==1, act['EAD']*act['pd_12m']*act['lgd']*disc1,
-      np.where(act['stage']==2, act['EAD']*act['pd_life']*act['lgd']*discL,
-                                 act['EAD']*np.minimum(1.0,act['lgd']*1.0)*1.0*discL))  # stage3 PD=1
-act['ECL']=ecl
+# %%
+# =====================================================================
+# 4) STAGING
+# =====================================================================
+since_pay = (SNAP - act['last_pymnt_m'].fillna(act['issue_m'])).values
+status = act['loan_status'].values
+dpd30 = np.isin(status, ['Late (31-120 days)', 'Default'])
+stage3 = (status == 'Default') | ((status == 'Late (31-120 days)') & (since_pay >= STAGE3_MONTHS))
+sicr = (act['pd12'] >= SICR_RATIO * act['pd12_expected']) & (act['pd12'] - act['pd12_expected'] >= SICR_ABS)
+act['stage'] = np.where(stage3, 3, np.where(dpd30 | sicr, 2, 1))
+print("Staging:", act['stage'].value_counts().sort_index().to_dict(),
+      f"| SICR-triggered (not 30+ dpd) {int((sicr & ~dpd30).sum()):,} | latest FICO available {act['last_fico'].notna().mean():.0%}")
 
+# %% [markdown]
+# ## 5. Loss given default
+# For each charge-off, LGD = 1 - net recoveries / principal outstanding at default. Recoveries keep arriving for
+# years, so only charge-offs whose default date is at least 24 months before the snapshot are averaged; more
+# recent ones would overstate LGD. LGD is applied by loan term.
+
+# %%
+# =====================================================================
+# 5) LGD  (charge-offs with at least 24 months of recovery history)
+# =====================================================================
+co = df[df['charged_off']].copy()
+co['ead_at_default'] = (num('funded_amnt').loc[co.index] - num('total_rec_prncp').loc[co.index]).clip(lower=0)
+co = co[co['ead_at_default'] > 0]
+co['net_recovery'] = (num('recoveries').loc[co.index].fillna(0) - num('collection_recovery_fee').loc[co.index].fillna(0)).clip(lower=0)
+co['lgd'] = (1 - co['net_recovery'] / co['ead_at_default']).clip(0, 1)
+co['default_year'] = (co['default_m'] // 12).astype(int)
+matured = co[co['default_m'] <= SNAP - LGD_WORKOUT]
+lgd_mean = float(matured['lgd'].mean()); lgd_all = float(co['lgd'].mean())
+lgd_by_term = matured.groupby('term_months')['lgd'].mean().to_dict()
+lgd_by_year = co.groupby('default_year')['lgd'].mean()
+print(f"LGD: {lgd_mean:.3f} on {len(matured):,} charge-offs with >= {LGD_WORKOUT} months of recoveries "
+      f"(all charge-offs: {lgd_all:.3f}, n={len(co):,})")
+act['lgd'] = act['term_months'].map(lgd_by_term).fillna(lgd_mean).values
+
+# %% [markdown]
+# ## 6. Expected credit loss
+# Month by month over each loan's remaining schedule: probability of surviving to the month x default rate in the
+# month x LGD x scheduled balance, discounted at the loan's monthly rate. Stage 1 sums the first 12 months,
+# Stage 2 the whole remaining life, and Stage 3 takes balance x LGD.
+
+# %%
+# =====================================================================
+# 6) ECL  (month-by-month over the remaining schedule)
+# =====================================================================
+bal0 = act['out_prncp'].astype(float).values
+inst = pd.to_numeric(act['installment'], errors='coerce').fillna(0).values
+r_m = (act['int_rate'].fillna(act['int_rate'].median()).clip(3, 35).values / 100) / 12
+lgd = act['lgd'].values
+def ecl_for(stage, mult=1.0, k=k_rep):
+    s = np.ones(n_act); bal = bal0.copy(); e12 = np.zeros(n_act); elife = np.zeros(n_act)
+    for t in range(1, MAXT+1):
+        m = np.minimum(age + t, MAXT)
+        h = np.clip(HTAB[gcode, m] * k * mult, 0, 0.99)
+        live = t <= rem
+        loss = np.where(live, s * h * lgd * bal / (1 + r_m) ** t, 0.0)
+        elife += loss; e12 += np.where(t <= 12, loss, 0.0)
+        s = np.where(live, s * (1 - h), s)
+        bal = np.maximum(bal * (1 + r_m) - inst, 0.0)
+    return np.where(stage == 1, e12, np.where(stage == 2, elife, bal0 * lgd))
+act['ECL'] = ecl_for(act['stage'].values)
 def book(a):
-    g=a.groupby('stage').agg(n=('ECL','size'),EAD=('EAD','sum'),ECL=('ECL','sum'))
-    g['coverage']=g['ECL']/g['EAD']; return g
-B=book(act)
-tot_ead=act['EAD'].sum(); tot_ecl=act['ECL'].sum(); cover=tot_ecl/tot_ead
-print("\nIFRS 9 staged book:")
-print(B.assign(EAD=lambda d:(d.EAD/1e6).round(1),ECL=lambda d:(d.ECL/1e6).round(2),
-               coverage=lambda d:(d.coverage*100).round(2)).to_string())
-print(f"  TOTAL EAD £{tot_ead/1e6:,.0f}m  ECL £{tot_ecl/1e6:,.1f}m  coverage {cover*100:.2f}%")
+    g = a.groupby('stage').agg(n=('ECL','size'), EAD=('out_prncp','sum'), ECL=('ECL','sum'))
+    g['coverage'] = g['ECL'] / g['EAD']; return g.reindex([1, 2, 3]).fillna(0)
+B = book(act); tot_ead = float(act['out_prncp'].sum()); tot_ecl = float(act['ECL'].sum())
+print("IFRS 9 staged book:"); print(B.assign(EAD=lambda d: (d.EAD/1e6).round(1), ECL=lambda d: (d.ECL/1e6).round(2),
+                                          coverage=lambda d: (d.coverage*100).round(2)).to_string())
+print(f"  TOTAL EAD {usd(tot_ead)}  ECL {usd(tot_ecl)}  coverage {tot_ecl/tot_ead*100:.2f}%")
 
-# =====================================================================
-# 4) MACROECONOMIC SCENARIOS  (PD multipliers grounded in vintage default)
-# =====================================================================
-vint=comp.groupby('issue_year')['default'].mean(); base_dr=comp['default'].mean()
-crisis=vint.loc[2007:2009].mean(); benign=vint.loc[2014:2016].mean()
-# Macro overlay: in production these PD multipliers come from a macroeconomic PD model
-# (linking unemployment / GDP to PD). Here they are an explicit, documented stress overlay,
-# because conditioning on matured loans removes most vintage variation from this sample.
-up_mult=0.85; down_mult=1.40
-W={'Upside':0.25,'Base':0.45,'Downside':0.30}; M={'Upside':up_mult,'Base':1.0,'Downside':down_mult}
-def ecl_scn(m):
-    p12=(act['pd_12m']*m).clip(0,1); pl=(act['pd_life']*m).clip(0,1)
-    e=np.where(act['stage']==1,act['EAD']*p12*act['lgd']*disc1,
-        np.where(act['stage']==2,act['EAD']*pl*act['lgd']*discL,
-                                  act['EAD']*np.minimum(1.0,act['lgd'])*discL))
-    return float(e.sum())
-scn={k:ecl_scn(M[k]) for k in M}; weighted=sum(W[k]*scn[k] for k in W)
-print(f"\nScenarios (PD mult): up x{up_mult:.2f}={scn['Upside']/1e6:.1f}m  base={scn['Base']/1e6:.1f}m  "
-      f"down x{down_mult:.2f}={scn['Downside']/1e6:.1f}m  | weighted £{weighted/1e6:.1f}m")
+# %% [markdown]
+# ### Scenarios and sensitivities
+# The scenarios multiply every PD by an illustrative overlay (0.85 upside, 1.00 base, 1.40 downside) and weight
+# the results 25/45/30. These are judgemental, not derived from a macroeconomic model. The sensitivities show
+# how much the allowance depends on two judgements: where loans 31-120 days late are staged, and how big a rise
+# in PD counts as significant.
 
+# %%
+# scenarios: judgemental overlays on PD, probability-weighted
+scn = {k: float(ecl_for(act['stage'].values, mult=m).sum()) for k, m in OVERLAY.items()}
+weighted = sum(WEIGHT[k] * scn[k] for k in scn)
+print("Scenario ECL (judgemental PD overlays):", {k: usd(v) for k, v in scn.items()}, "| weighted", usd(weighted))
+
+# sensitivity: treatment of the 31-120 dpd bucket, and the SICR multiple
+alt3 = np.where(dpd30, 3, np.where(sicr, 2, 1)); alt2 = np.where(status == 'Default', 3, np.where(dpd30 | sicr, 2, 1))
+sens_bucket = {"all 31-120 dpd in Stage 3": float(ecl_for(alt3).sum()), "base (3+ months unpaid in Stage 3)": tot_ecl,
+               "all 31-120 dpd in Stage 2": float(ecl_for(alt2).sum())}
+ratios = [1.5, 2.0, 2.5, 3.0, 4.0]; s2_share = []; ecl_sicr = []
+for q in ratios:
+    sq = (act['pd12'] >= q*act['pd12_expected']) & (act['pd12'] - act['pd12_expected'] >= SICR_ABS)
+    st = np.where(stage3, 3, np.where(dpd30 | sq, 2, 1))
+    s2_share.append(float(act['out_prncp'][st == 2].sum() / tot_ead * 100)); ecl_sicr.append(float(ecl_for(st).sum()))
+
+# %% [markdown]
+# ## 7. Figures
+# ### 12-month PD: calibration and discrimination, out of time
+
+# %%
 # =====================================================================
 # FIGURES
 # =====================================================================
-# F1 PD calibration + discrimination
-frac,mean_p=calibration_curve(te['default'],te_p,n_bins=10,strategy='quantile')
-fig,ax=plt.subplots(1,2,figsize=(11,4.3))
-ax[0].plot([0,1],[0,1],'--',color=SLATE,lw=1); ax[0].plot(mean_p,frac,'o-',color=NAVY,lw=2,ms=5)
-ax[0].set_xlabel("Predicted PD"); ax[0].set_ylabel("Observed default rate"); ax[0].set_title("PD calibration (test, 2016-2018 vintages)")
-ax[1].plot(fpr,tpr,color=TEAL,lw=2,label=f"AUC {auc:.3f} / KS {ks:.3f}"); ax[1].plot([0,1],[0,1],'--',color=SLATE,lw=1)
-ax[1].fill_between(fpr,fpr,tpr,color=TEAL,alpha=0.12); ax[1].set_xlabel("False positive rate"); ax[1].set_ylabel("True positive rate")
-ax[1].set_title("PD discrimination"); ax[1].legend(loc="lower right",frameon=False)
-plt.tight_layout(); plt.savefig(f"{FIG}/01_pd_validation.png",bbox_inches="tight"); plt.close()
+frac, mean_p = calibration_curve(te['bad_12'], te_p, n_bins=10, strategy='quantile')
+fig, ax = plt.subplots(1, 2, figsize=(11, 4.3))
+ax[0].plot([0, 1], [0, 1], '--', color=SLATE, lw=1); ax[0].plot(mean_p, frac, 'o-', color=NAVY, lw=2, ms=5)
+lim = max(frac.max(), mean_p.max()) * 1.1; ax[0].set_xlim(0, lim); ax[0].set_ylim(0, lim)
+ax[0].set_xlabel("Predicted 12-month PD"); ax[0].set_ylabel("Observed 12-month default rate")
+ax[0].set_title(f"12m PD calibration, out of time (P/O {po_ratio:.2f})")
+ax[1].plot(fpr, tpr, color=TEAL, lw=2, label=f"AUC {auc:.3f} / KS {ks:.3f}"); ax[1].plot([0, 1], [0, 1], '--', color=SLATE, lw=1)
+ax[1].fill_between(fpr, fpr, tpr, color=TEAL, alpha=0.12); ax[1].set_xlabel("False positive rate"); ax[1].set_ylabel("True positive rate")
+ax[1].set_title("12m PD discrimination, out of time"); ax[1].legend(loc="lower right", frameon=False)
+plt.tight_layout(); plt.savefig(f"{FIG}/01_pd_validation.png", bbox_inches="tight"); plt.close()
 
-# F2 LGD
-fig,ax=plt.subplots(figsize=(8,4.6))
-ax.hist(co['lgd'],bins=40,color=AMBER,edgecolor="white",alpha=0.9)
-ax.axvline(lgd_mean,color=NAVY,lw=2,ls='--',label=f"portfolio LGD {lgd_mean:.2f}")
-ax.set_xlabel("Loss given default (1 - recovery rate)"); ax.set_ylabel("Charged-off loans")
-ax.set_title(f"Empirical LGD from {len(co):,} defaulted loans (recovery rate {rec_rate:.0%})")
-ax.legend(frameon=False); plt.tight_layout(); plt.savefig(f"{FIG}/02_lgd_distribution.png",bbox_inches="tight"); plt.close()
+# %% [markdown]
+# ### Loss given default
 
-# F3 staging portfolio (EAD + counts)
-fig,ax=plt.subplots(1,2,figsize=(11,4.3))
-cols=[GREEN,AMBER,RED]; labels=[f"Stage {i}" for i in [1,2,3]]
-ax[0].bar(labels,[B.loc[i,'EAD'] for i in [1,2,3]],color=cols,edgecolor="white")
-ax[0].yaxis.set_major_formatter(FuncFormatter(gbp)); ax[0].set_title("Exposure at default (EAD) by stage")
-ax[1].bar(labels,[B.loc[i,'n'] for i in [1,2,3]],color=cols,edgecolor="white")
-ax[1].yaxis.set_major_formatter(FuncFormatter(lambda x,_:f"{x/1e3:,.0f}k")); ax[1].set_title("Number of loans by stage")
-plt.tight_layout(); plt.savefig(f"{FIG}/03_staging_portfolio.png",bbox_inches="tight"); plt.close()
+# %%
+fig, ax = plt.subplots(1, 2, figsize=(11, 4.3))
+ax[0].hist(matured['lgd'], bins=40, color=AMBER, edgecolor="white", alpha=0.9)
+ax[0].axvline(lgd_mean, color=NAVY, lw=2, ls='--', label=f"LGD {lgd_mean:.2f}")
+ax[0].set_xlabel("Loss given default"); ax[0].set_ylabel("Charge-offs"); ax[0].legend(frameon=False)
+ax[0].set_title(f"LGD, charge-offs with {LGD_WORKOUT}+ months of recoveries")
+ax[1].bar(lgd_by_year.index.astype(str), lgd_by_year.values, color=[NAVY if y*12 + 11 <= SNAP-LGD_WORKOUT else "#9AA7B5" for y in lgd_by_year.index])
+ax[1].set_ylim(max(0, lgd_by_year.min()-0.05), 1); ax[1].set_title("LGD by default year (grey: recoveries incomplete)")
+ax[1].tick_params(axis='x', rotation=45)
+plt.tight_layout(); plt.savefig(f"{FIG}/02_lgd_distribution.png", bbox_inches="tight"); plt.close()
 
-# F4 ECL and coverage by stage
-fig,ax=plt.subplots(1,2,figsize=(11,4.3))
-ax[0].bar(labels,[B.loc[i,'ECL'] for i in [1,2,3]],color=cols,edgecolor="white")
-ax[0].yaxis.set_major_formatter(FuncFormatter(gbp)); ax[0].set_title("ECL by stage")
-ax[1].bar(labels,[B.loc[i,'coverage']*100 for i in [1,2,3]],color=cols,edgecolor="white")
-ax[1].set_ylabel("%"); ax[1].set_title("Coverage ratio (ECL / EAD) by stage")
-for i,v in enumerate([B.loc[s,'coverage']*100 for s in [1,2,3]]): ax[1].text(i,v,f"{v:.1f}%",ha="center",va="bottom",fontsize=9)
-plt.tight_layout(); plt.savefig(f"{FIG}/04_ecl_by_stage.png",bbox_inches="tight"); plt.close()
+# %% [markdown]
+# ### Exposure and loan count by stage
 
-# F5 macro scenarios
-fig,ax=plt.subplots(figsize=(8.2,4.6))
-order=['Upside','Base','Downside']; vals=[scn[k] for k in order]
-bars=ax.bar(order,vals,color=[GREEN,NAVY,RED],edgecolor="white")
-ax.axhline(weighted,color=AMBER,lw=2,ls='--',label=f"probability-weighted ECL ${weighted/1e6:.1f}m")
-ax.yaxis.set_major_formatter(FuncFormatter(gbp)); ax.set_title("ECL under macroeconomic scenarios")
-for b,v in zip(bars,vals): ax.text(b.get_x()+b.get_width()/2,v,gbp(v),ha="center",va="bottom",fontsize=9)
-ax.legend(frameon=False); plt.tight_layout(); plt.savefig(f"{FIG}/05_macro_scenarios.png",bbox_inches="tight"); plt.close()
+# %%
+cols = [GREEN, AMBER, RED]; labels = ["Stage 1", "Stage 2", "Stage 3"]
+fig, ax = plt.subplots(1, 2, figsize=(11, 4.3))
+ax[0].bar(labels, B['EAD'].values, color=cols, edgecolor="white"); ax[0].yaxis.set_major_formatter(FuncFormatter(usd)); ax[0].set_title("Exposure at default by stage")
+ax[1].bar(labels, B['n'].values, color=cols, edgecolor="white"); ax[1].yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x/1e3:,.0f}k")); ax[1].set_title("Number of loans by stage")
+plt.tight_layout(); plt.savefig(f"{FIG}/03_staging_portfolio.png", bbox_inches="tight"); plt.close()
 
-# F6 vintage default (through-the-cycle anchor)
-fig,ax=plt.subplots(figsize=(8.6,4.4))
-ax.bar(vint.index.astype(int).astype(str),vint.values*100,color=NAVY,edgecolor="white")
-ax.axhline(base_dr*100,color=AMBER,lw=1.6,ls='--',label=f"through-the-cycle {base_dr*100:.1f}%")
-ax.set_ylabel("Default rate (%)"); ax.set_title("Default rate by origination vintage (through-the-cycle anchor)")
-ax.legend(frameon=False); plt.tight_layout(); plt.savefig(f"{FIG}/06_vintage_default.png",bbox_inches="tight"); plt.close()
+# %% [markdown]
+# ### ECL and coverage by stage
 
-# F7 ECL sensitivity to the SICR (Stage 2) threshold
-qs=np.linspace(0.75,0.95,9); s2share=[]; ecls=[]
-for q in qs:
-    thr=act['pd_life'].quantile(q)
-    st=np.where(act['loan_status'].isin({'Late (31-120 days)','Default'}),3,
-         np.where(act['loan_status'].isin({'In Grace Period','Late (16-30 days)'})|(act['pd_life']>thr),2,1))
-    e=np.where(st==1,act['EAD']*act['pd_12m']*act['lgd']*disc1,
-        np.where(st==2,act['EAD']*act['pd_life']*act['lgd']*discL,
-                       act['EAD']*np.minimum(1.0,act['lgd'])*discL))
-    s2share.append(float(act['EAD'][st==2].sum()/tot_ead*100)); ecls.append(float(e.sum()))
-fig,ax=plt.subplots(figsize=(8.6,4.5)); ax2=ax.twinx()
-xx=(1-qs)*100
-l1=ax.plot(xx,s2share,'o-',color=AMBER,lw=2,label="Stage 2 EAD share")
-l2=ax2.plot(xx,np.array(ecls)/1e6,'s--',color=NAVY,lw=2,label="Total ECL")
-ax.set_xlabel("Share of performing book flagged SICR by the PD rule (%)")
-ax.set_ylabel("Stage 2 EAD share (%)",color=AMBER); ax2.set_ylabel("Total ECL ($m)",color=NAVY)
-ax.set_title("ECL sensitivity to the SICR (Stage 2) threshold")
-ax.legend(handles=l1+l2,loc="upper left",frameon=False)
-plt.tight_layout(); plt.savefig(f"{FIG}/07_sicr_sensitivity.png",bbox_inches="tight"); plt.close()
+# %%
+fig, ax = plt.subplots(1, 2, figsize=(11, 4.3))
+ax[0].bar(labels, B['ECL'].values, color=cols, edgecolor="white"); ax[0].yaxis.set_major_formatter(FuncFormatter(usd)); ax[0].set_title("ECL by stage")
+ax[1].bar(labels, B['coverage'].values*100, color=cols, edgecolor="white"); ax[1].set_ylabel("%"); ax[1].set_title("Coverage (ECL / EAD) by stage")
+for i, v in enumerate(B['coverage'].values*100): ax[1].text(i, v, f"{v:.1f}%", ha="center", va="bottom", fontsize=9)
+plt.tight_layout(); plt.savefig(f"{FIG}/04_ecl_by_stage.png", bbox_inches="tight"); plt.close()
 
+# %% [markdown]
+# ### ECL under the scenario overlays
+
+# %%
+fig, ax = plt.subplots(figsize=(8.2, 4.6)); order = list(OVERLAY)
+bars = ax.bar(order, [scn[k] for k in order], color=[GREEN, NAVY, RED], edgecolor="white")
+ax.axhline(weighted, color=AMBER, lw=2, ls='--', label=f"probability-weighted {usd(weighted)}")
+ax.yaxis.set_major_formatter(FuncFormatter(usd)); ax.set_title("ECL under illustrative judgemental scenario overlays")
+for b, k in zip(bars, order): ax.text(b.get_x()+b.get_width()/2, scn[k], f"{usd(scn[k])}\n(PD x{OVERLAY[k]:.2f}, w {WEIGHT[k]:.0%})", ha="center", va="bottom", fontsize=8.5)
+ax.legend(frameon=False, loc="upper left"); plt.tight_layout(); plt.savefig(f"{FIG}/05_macro_scenarios.png", bbox_inches="tight"); plt.close()
+
+# %% [markdown]
+# ### Default term structure by grade
+
+# %%
+fig, ax = plt.subplots(figsize=(9, 4.6))
+for g, col in zip(['A', 'C', 'E'], [GREEN, NAVY, RED]):
+    if g in H: ax.plot(range(1, MAXT+1), np.array(H[g][1:])*100, color=col, lw=2, label=f"grade {g}")
+ax.plot(range(1, MAXT+1), np.array(H_pool[1:])*100, color=SLATE, lw=1.4, ls='--', label="all grades")
+ax.set_xlabel("Months on book"); ax.set_ylabel("Monthly default rate (%)"); ax.legend(frameon=False)
+ax.set_title("Default term structure: marginal default rate by months on book")
+plt.tight_layout(); plt.savefig(f"{FIG}/06_term_structure.png", bbox_inches="tight"); plt.close()
+
+# %% [markdown]
+# ### Sensitivity to the SICR threshold
+
+# %%
+fig, ax = plt.subplots(figsize=(8.6, 4.5)); ax2 = ax.twinx()
+l1 = ax.plot([f"x{q:g}" for q in ratios], s2_share, 'o-', color=AMBER, lw=2, label="Stage 2 EAD share")
+l2 = ax2.plot([f"x{q:g}" for q in ratios], np.array(ecl_sicr)/1e6, 's--', color=NAVY, lw=2, label="Total ECL")
+ax.set_xlabel("SICR rule: reporting 12m PD at least this multiple of the origination expectation")
+ax.set_ylabel("Stage 2 EAD share (%)", color=AMBER); ax2.set_ylabel("Total ECL ($m)", color=NAVY)
+ax.set_title("ECL sensitivity to the SICR threshold"); ax.legend(handles=l1+l2, loc="upper right", frameon=False)
+plt.tight_layout(); plt.savefig(f"{FIG}/07_sicr_sensitivity.png", bbox_inches="tight"); plt.close()
+
+# %% [markdown]
+# ## Save the results
+# `results.json` holds every number quoted in the README; a 50,000-loan sample of the scored book goes to
+# `data/scored_portfolio_sample.csv`.
+
+# %%
 # =====================================================================
-SUMMARY=dict(
- n_total=int(len(df)), n_completed=int(df['completed'].sum()), n_active=int(len(act)),
- pd_auc=round(auc,3), pd_gini=round(gini,3), pd_ks=round(ks,3), portfolio_dr=round(base_dr,4),
- lgd_mean=round(lgd_mean,3), recovery_rate=round(rec_rate,3), n_lgd=int(len(co)),
- sicr_threshold_pd=round(float(SICR),3),
- total_ead=round(tot_ead,0), total_ecl=round(tot_ecl,0), coverage=round(cover,4),
- stage={int(i):dict(n=int(B.loc[i,'n']),ead=round(B.loc[i,'EAD'],0),ecl=round(B.loc[i,'ECL'],0),
-                    coverage=round(B.loc[i,'coverage'],4)) for i in [1,2,3]},
- scenarios={k:round(scn[k],0) for k in scn}, weights=W, pd_mult=dict(up=round(up_mult,3),down=round(down_mult,3)),
- weighted_ecl=round(weighted,0), crisis_dr=round(float(crisis),4), benign_dr=round(float(benign),4))
-json.dump(SUMMARY,open(f"{OUT}/results.json","w"),indent=2)
-# save scored active book sample
-act[['loan_status','stage','EAD','pd_12m','pd_life','lgd','ECL','int_rate','fico','dti']].sample(min(50000,len(act)),random_state=1)\
-   .to_csv(f"{DAT}/scored_portfolio_sample.csv",index=False)
-print("\n=== SUMMARY ==="); print(json.dumps(SUMMARY,indent=2))
-print("\nDONE: figures + results written.")
+SUMMARY = dict(
+ snapshot=lc.month_label(SNAP), currency="USD", n_total=int(len(df)), n_active=int(n_act),
+ active_definition="Current, In Grace Period, Late (16-30), Late (31-120) or Default with principal outstanding",
+ pd_model=dict(outcome="default within 12 months of issue", train=f"<=2015 (n={len(tr):,})",
+               out_of_time=f"2016-{int(te['issue_year'].max())} (n={len(te):,})", auc=round(auc, 3), gini=round(gini, 3),
+               ks=round(ks, 3), predicted_over_observed=round(po_ratio, 3)),
+ lgd=dict(mean_matured=round(lgd_mean, 3), n_matured=int(len(matured)), mean_all_chargeoffs=round(lgd_all, 3),
+          workout_months=LGD_WORKOUT),
+ staging=dict(rule=f"Stage 3: Default status, or Late (31-120) with {STAGE3_MONTHS}+ months since last payment; "
+                   f"Stage 2: 31+ dpd, or 12m PD >= {SICR_RATIO}x the origination expectation and +{SICR_ABS:.0%}",
+              latest_fico_available=round(float(act['last_fico'].notna().mean()), 3),
+              sicr_only=int((sicr & ~dpd30).sum())),
+ total_ead=round(tot_ead, 0), total_ecl=round(tot_ecl, 0), coverage=round(tot_ecl/tot_ead, 4),
+ stage={int(i): dict(n=int(B.loc[i, 'n']), ead=round(float(B.loc[i, 'EAD']), 0), ecl=round(float(B.loc[i, 'ECL']), 0),
+                     coverage=round(float(B.loc[i, 'coverage']), 4)) for i in [1, 2, 3]},
+ scenarios={k: round(v, 0) for k, v in scn.items()}, overlays=OVERLAY, weights=WEIGHT,
+ scenario_note="illustrative judgemental PD overlays, not a macroeconomic model",
+ weighted_ecl=round(weighted, 0),
+ sensitivity_31_120_bucket={k: round(v, 0) for k, v in sens_bucket.items()},
+ sensitivity_sicr={f"x{q:g}": dict(stage2_ead_pct=round(a, 2), ecl=round(b, 0)) for q, a, b in zip(ratios, s2_share, ecl_sicr)})
+json.dump(SUMMARY, open(f"{OUT}/results.json", "w"), indent=2)
+act[['loan_status','stage','out_prncp','pd12_expected','pd12','pd_life','lgd','ECL','int_rate','fico','last_fico']]\
+   .sample(min(50000, n_act), random_state=1).round(5).to_csv(f"{DAT}/scored_portfolio_sample.csv", index=False)
+print("\n=== SUMMARY ==="); print(json.dumps(SUMMARY, indent=2)); print("\nDONE: figures + results written.")
+
+# %% [markdown]
+# ## Limitations
+# - **PD does not use current arrears.** The PD model and term structure use application data, age and grade,
+#   not whether a loan is behind today. Loans 31-120 days late that stay in Stage 2 are therefore likely
+#   under-provided; the staging sensitivity shows the range.
+# - **Scenarios are judgemental overlays**, not a macroeconomic model linking PD to unemployment or GDP.
+# - **No prepayment in EAD.** Balances follow the contractual schedule; many of these loans repay early, so
+#   lifetime ECL is somewhat overstated.
+# - **LGD ignores recovery timing.** Recoveries are not discounted back to the default date, which slightly
+#   understates LGD.
+# - **One snapshot, one book.** There is no movement between reporting dates, and the term structure pools
+#   2007-2018 vintages, so it reflects a benign US credit period on average.
